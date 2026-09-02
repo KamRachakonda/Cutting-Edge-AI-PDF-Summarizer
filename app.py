@@ -1,559 +1,118 @@
-import os
-import re
-import io
-import base64
-from datetime import datetime
-from html import escape
-import unicodedata
+import json
 import streamlit as st
 import pandas as pd
-import plotly.express as px
-from reportlab.lib import colors
-from reportlab.lib.enums import TA_CENTER
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
-from reportlab.lib.units import inch
-from reportlab.platypus import (
-    Paragraph,
-    SimpleDocTemplate,
-    Spacer,
-    Table,
-    TableStyle,
-)
-from pypdf import PdfReader
-from dotenv import load_dotenv
 
-# Import backend classes
-from pdf_processor import PDFSummarizer, SummaryFormatter
-from utility import TextProcessor, ErrorHandler
+from career_documents import extract_document, classify_document
+from career_rag import CareerRAG
+from career_ai import CareerAI
+from career_config import GROQ_API_KEY, TAVILY_API_KEY, WEIGHTS
+from career_research import research_context, format_research
 
+st.set_page_config(page_title="AI Career Intelligence", page_icon="🚀", layout="wide")
+st.markdown("""<style>.main .block-container{max-width:1400px;padding-top:1.5rem}.hero{padding:2rem 2.5rem;border-radius:18px;background:linear-gradient(135deg,#0f172a,#312e81);color:white;margin-bottom:1.5rem}.hero h1{font-size:2.6rem;margin:0}.hero p{color:#dbeafe;font-size:1.05rem}</style>""", unsafe_allow_html=True)
+st.markdown("""<div class='hero'><h1>🚀 AI Career Intelligence Platform</h1><p>Resume + Position Description + semantic RAG + optional external research.</p></div>""", unsafe_allow_html=True)
 
-with open("pdf-summarizer-banner.png", "rb") as banner_file:
-    banner_image = base64.b64encode(banner_file.read()).decode("ascii")
+if not GROQ_API_KEY: st.warning("GROQ_API_KEY is not configured. Add it to .env.")
+if "docs" not in st.session_state: st.session_state.docs=[]
+if "rag" not in st.session_state: st.session_state.rag=None
+if "resume_analysis" not in st.session_state: st.session_state.resume_analysis=None
+if "pd_analysis" not in st.session_state: st.session_state.pd_analysis=None
+if "match" not in st.session_state: st.session_state.match=None
+if "research" not in st.session_state: st.session_state.research=[]
 
-
-def pdf_safe_text(value: object) -> str:
-    """Convert generated text to characters supported by ReportLab's built-in fonts."""
-    replacements = str.maketrans({
-        "\u2018": "'",
-        "\u2019": "'",
-        "\u201c": '"',
-        "\u201d": '"',
-        "\u2013": "-",
-        "\u2014": "-",
-        "\u2026": "...",
-        "\u00a0": " ",
-    })
-    normalized = unicodedata.normalize(
-        "NFKD", str(value)).translate(replacements)
-    return normalized.encode("ascii", "replace").decode("ascii")
-
-
-def extract_pdf_text(reader: PdfReader, pdf_bytes: bytes) -> tuple[str, bool]:
-    """Extract embedded text and OCR pages that contain scanned images."""
-    page_text = [page.extract_text() or "" for page in reader.pages]
-    if all(text.strip() for text in page_text):
-        return "\n".join(page_text).strip(), False
-
-    try:
-        import pypdfium2 as pdfium
-        import pytesseract
-    except ImportError as error:
-        raise RuntimeError(
-            "OCR support is unavailable. Install the project requirements and Tesseract OCR."
-        ) from error
-
-    rendered_document = pdfium.PdfDocument(pdf_bytes)
-    ocr_text = []
-    for page_number, text in enumerate(page_text):
-        if text.strip():
-            ocr_text.append(text)
-            continue
-        page = rendered_document[page_number]
-        image = page.render(scale=2.2).to_pil()
-        ocr_text.append(pytesseract.image_to_string(image))
-        page.close()
-    rendered_document.close()
-    return "\n".join(ocr_text).strip(), True
-
-
-def extract_numeric_statistics(text: str) -> pd.DataFrame:
-    """Extract simple label/value statistics from lines in extracted PDF text."""
-    statistics = []
-    pattern = re.compile(
-        r"^\s*([A-Za-z][A-Za-z &'()/.-]{1,40})\s*(?::|[-–])\s*"
-        r"(?:[$€£₹]\s*)?(-?\d[\d,]*(?:\.\d+)?)\s*(%|percent)?\s*$",
-        re.IGNORECASE,
-    )
-    for line in text.splitlines():
-        match = pattern.match(line.strip())
-        if match:
-            label, value, unit = match.groups()
-            statistics.append({
-                "Statistic": label.strip().title(),
-                "Value": float(value.replace(",", "")),
-                "Unit": "%" if unit else "",
-            })
-    return pd.DataFrame(statistics).drop_duplicates(subset=["Statistic"])
-
-
-def create_summary_pdf(
-    filename: str,
-    summary: str,
-    document_stats: dict,
-    numeric_stats: pd.DataFrame,
-) -> bytes:
-    """Create a print-ready executive summary PDF in memory."""
-    safe_filename = pdf_safe_text(filename)
-    pdf_buffer = io.BytesIO()
-    document = SimpleDocTemplate(
-        pdf_buffer,
-        pagesize=A4,
-        rightMargin=0.65 * inch,
-        leftMargin=0.65 * inch,
-        topMargin=0.6 * inch,
-        bottomMargin=0.6 * inch,
-        title=f"Executive Summary - {safe_filename}",
-        author="Kam Rachakonda",
-    )
-    styles = getSampleStyleSheet()
-    title_style = ParagraphStyle(
-        "ReportTitle",
-        parent=styles["Title"],
-        fontName="Helvetica-Bold",
-        fontSize=22,
-        leading=27,
-        textColor=colors.HexColor("#312e81"),
-        alignment=TA_CENTER,
-        spaceAfter=8,
-    )
-    subtitle_style = ParagraphStyle(
-        "ReportSubtitle",
-        parent=styles["Normal"],
-        fontSize=10,
-        textColor=colors.HexColor("#64748b"),
-        alignment=TA_CENTER,
-        spaceAfter=22,
-    )
-    heading_style = ParagraphStyle(
-        "ReportHeading",
-        parent=styles["Heading2"],
-        fontName="Helvetica-Bold",
-        fontSize=13,
-        textColor=colors.HexColor("#1e1b4b"),
-        spaceBefore=12,
-        spaceAfter=8,
-    )
-    body_style = ParagraphStyle(
-        "ReportBody",
-        parent=styles["BodyText"],
-        fontName="Helvetica",
-        fontSize=10.5,
-        leading=16,
-        textColor=colors.HexColor("#334155"),
-        spaceAfter=8,
-    )
-
-    story = [
-        Paragraph("Executive PDF Summary", title_style),
-        Paragraph(
-            f"{escape(safe_filename)} &nbsp;|&nbsp; Generated {datetime.now().strftime('%B %d, %Y')}",
-            subtitle_style,
-        ),
-        Paragraph("Document Overview", heading_style),
-    ]
-    overview_data = [
-        ["Pages", "Words", "Characters", "Estimated reading time"],
-        [
-            pdf_safe_text(document_stats.get("pages", "-")),
-            pdf_safe_text(f"{document_stats.get('words', 0):,}"),
-            pdf_safe_text(f"{document_stats.get('characters', 0):,}"),
-            pdf_safe_text(document_stats.get("reading_time", "-")),
-        ],
-    ]
-    overview_table = Table(overview_data, colWidths=[1.65 * inch] * 4)
-    overview_table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#312e81")),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("BACKGROUND", (0, 1), (-1, 1), colors.HexColor("#eef2ff")),
-        ("TEXTCOLOR", (0, 1), (-1, 1), colors.HexColor("#1e293b")),
-        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("FONTNAME", (0, 1), (-1, 1), "Helvetica-Bold"),
-        ("FONTSIZE", (0, 0), (-1, -1), 9),
-        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-        ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#c7d2fe")),
-        ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#c7d2fe")),
-        ("TOPPADDING", (0, 0), (-1, -1), 9),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 9),
-    ]))
-    story.extend([overview_table, Paragraph("Summary", heading_style)])
-    summary_text = escape(pdf_safe_text(summary)).replace("\n", "<br/>")
-    story.append(Paragraph(summary_text, body_style))
-
-    if not numeric_stats.empty:
-        story.append(Paragraph("Extracted Statistics", heading_style))
-        statistics_data = [["Statistic", "Value", "Unit"]]
-        for _, row in numeric_stats.iterrows():
-            statistics_data.append([
-                escape(pdf_safe_text(row["Statistic"])),
-                f"{row['Value']:,.2f}".rstrip("0").rstrip("."),
-                escape(pdf_safe_text(row["Unit"])),
-            ])
-        statistics_table = Table(statistics_data, colWidths=[
-                                 3.5 * inch, 1.5 * inch, 1 * inch])
-        statistics_table.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#312e81")),
-            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#cbd5e1")),
-            ("ROWBACKGROUNDS", (0, 1), (-1, -1),
-             [colors.white, colors.HexColor("#f8fafc")]),
-            ("ALIGN", (1, 1), (-1, -1), "RIGHT"),
-            ("FONTSIZE", (0, 0), (-1, -1), 9.5),
-            ("TOPPADDING", (0, 0), (-1, -1), 7),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
-        ]))
-        story.append(statistics_table)
-
-    story.extend([
-        Spacer(1, 28),
-        Paragraph("Designed by Kam Rachakonda", ParagraphStyle(
-            "Signature",
-            parent=styles["Normal"],
-            fontSize=9,
-            textColor=colors.HexColor("#64748b"),
-            alignment=TA_CENTER,
-        )),
-    ])
-    document.build(story)
-    return pdf_buffer.getvalue()
-
-
-# Load environment variables (.env)
-load_dotenv()
-GITHUB_URL = "https://github.com/KamRachakonda/Cutting-Edge-AI-PDF-Summarizer"
-
-# Page configuration
-st.set_page_config(
-    page_title="SummarizeAI — Intelligent PDF Studio",
-    page_icon="✨",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-# Custom Styling
-st.markdown(
-    """
-    <style>
-        /* Global layout tweaks */
-        .main .block-container {
-        padding-top: 2rem;
-            padding-bottom: 3rem;
-            max-width: 1000px;
-        }
-
-        /* Hero Header */
-        .hero-container {
-            min-height: 310px;
-            display: flex;
-            align-items: center;
-            padding: 2.5rem 4rem;
-            background: linear-gradient(90deg, rgba(15, 23, 42, .96) 0%, rgba(30, 27, 75, .84) 38%, rgba(49, 46, 129, .18) 78%), url('data:image/png;base64,__BANNER_IMAGE__') center/cover;
-            border-radius: 16px;
-            color: white;
-            margin-bottom: 2rem;
-            box-shadow: 0 18px 35px -12px rgba(15, 23, 42, .4);
-            overflow: hidden;
-        }
-        .hero-content {
-            max-width: 530px;
-            text-align: left;
-        }
-        .hero-kicker {
-            display: inline-block;
-            margin-bottom: .9rem;
-            color: #93c5fd;
-            font-size: .76rem;
-            font-weight: 700;
-            letter-spacing: .16em;
-            text-transform: uppercase;
-        }
-        .hero-title {
-            font-size: 2.65rem;
-            line-height: 1.1;
-            font-weight: 800;
-            letter-spacing: -0.02em;
-            margin: 0;
-            color: #ffffff;
-        }
-        .hero-subtitle {
-            max-width: 460px;
-            font-size: 1.05rem;
-            color: #dbeafe;
-            margin: 1rem 0 0;
-            line-height: 1.65;
-            font-weight: 400;
-        }
-
-        /* Stat Card Badges */
-        .metric-container {
-        background-color: #f8fafc;
-            border: 1px solid #e2e8f0;
-            border-radius: 12px;
-            padding: 1.2rem;
-            text-align: center;
-            box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.05);
-        }
-        .metric-value {
-        font-size: 1.6rem;
-            font-weight: 700;
-            color: #1e293b;
-        }
-        .metric-label {
-        font-size: 0.8rem;
-            font-weight: 600;
-            text-transform: uppercase;
-            letter-spacing: 0.05em;
-            color: #64748b;
-            margin-top: 0.2rem;
-        }
-
-        /* Summary Card Box */
-        .summary-card {
-        background: #ffffff;
-            border-radius: 14px;
-            padding: 1.8rem;
-            border: 1px solid #e2e8f0;
-            border-left: 5px solid #4f46e5;
-            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);
-            margin-top: 1.5rem;
-            line-height: 1.7;
-            font-size: 1rem;
-            color: #334155;
-        }
-
-        /* Buttons */
-        div.stButton > button:first-child {
-        width: 100%;
-            height: 3rem;
-            font-size: 1.05rem;
-            font-weight: 600;
-            border-radius: 10px;
-            background: linear-gradient(135deg, #4f46e5 0%, #4338ca 100%);
-            color: white;
-            border: none;
-            transition: all 0.2s ease-in-out;
-            box-shadow: 0 4px 14px 0 rgba(79, 70, 229, 0.35);
-        }
-        div.stButton > button:first-child:hover {
-        transform: translateY(-1px);
-            box-shadow: 0 6px 20px 0 rgba(79, 70, 229, 0.45);
-        }
-        @media (max-width: 700px) {
-            .hero-container { min-height: 330px; padding: 2rem 1.5rem; background-position: center; }
-            .hero-title { font-size: 2.05rem; }
-        }
-    </style>
-    """.replace("__BANNER_IMAGE__", banner_image),
-    unsafe_allow_html=True,
-)
-
-# Hero Header
-st.markdown(
-    """
-    <div class="hero-container">
-        <div class="hero-content">
-            <div class="hero-kicker">AI-powered document intelligence</div>
-            <h1 class="hero-title">✨ Cutting-Edge AI PDF Summarizer</h1>
-            <p class="hero-subtitle">Save hours by turning complex papers into instant insights. Stop reading pages. Start getting answers instantly.</p>
-        </div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-# Sidebar Configuration
 with st.sidebar:
-    with st.expander("⚙️ Summary Settings", expanded=True):
-        st.caption("Customize how your document should be analyzed.")
+    st.header("📂 Document Intelligence")
+    files=st.file_uploader("Upload Resume, PD/JD and supporting documents", type=["pdf","docx","txt","md","csv","json","log"], accept_multiple_files=True)
+    web_enabled=st.checkbox("🌐 Enable external research", value=bool(TAVILY_API_KEY), disabled=not bool(TAVILY_API_KEY))
+    if not TAVILY_API_KEY: st.caption("Add TAVILY_API_KEY to enable web research.")
+    if files and st.button("📥 Index Documents", use_container_width=True):
+        docs=[]
+        for f in files:
+            try:
+                text,meta=extract_document(f.name,f.getvalue())
+                docs.append({"filename":f.name,"text":text,"type":classify_document(f.name,text),"meta":meta})
+            except Exception as e: st.error(f"{f.name}: {e}")
+        if docs:
+            rag=CareerRAG(); rag.add_documents(docs)
+            st.session_state.docs=docs; st.session_state.rag=rag
+            st.session_state.resume_analysis=None; st.session_state.pd_analysis=None; st.session_state.match=None
+            st.success(f"Indexed {len(docs)} document(s)")
+    if st.session_state.docs:
+        st.subheader("Indexed Documents")
+        for d in st.session_state.docs: st.write(f"**{d['type']}** — {d['filename']}")
 
-        summary_type_options = {
-            "concise": "⚡ Concise (5-10 Sentences)",
-            "detailed": "📑 Detailed (Headings & Depth)",
-            "bullet_points": "📌 Key Bullet Points",
-            "bar_chart": "📊 Bar Chart + Summary",
-            "pie_chart": "🥧 Pie Chart + Summary",
-        }
+if not st.session_state.docs:
+    st.info("Upload your resume and target PD/JD, then click Index Documents.")
+    st.stop()
 
-        selected_type_key = st.selectbox(
-            "Format Style",
-            options=list(summary_type_options.keys()),
-            format_func=lambda x: summary_type_options[x],
-            index=0,
-        )
+resume_docs=[d for d in st.session_state.docs if d["type"]=="Resume"]
+pd_docs=[d for d in st.session_state.docs if d["type"]=="Position Description"]
+if not resume_docs or not pd_docs:
+    st.warning("Automatic classification needs help. Select the documents manually.")
+    names=[d["filename"] for d in st.session_state.docs]
+    c1,c2=st.columns(2)
+    with c1: rn=st.selectbox("Resume",names)
+    with c2: pn=st.selectbox("Position Description / JD",names)
+    resume_docs=[d for d in st.session_state.docs if d["filename"]==rn]
+    pd_docs=[d for d in st.session_state.docs if d["filename"]==pn]
+resume_text="\n\n".join(d["text"] for d in resume_docs)
+pd_text="\n\n".join(d["text"] for d in pd_docs)
+ai=CareerAI()
 
-        st.markdown("---")
-        st.markdown("### 🎯 Fine-Tune Instructions")
-        custom_prompt = st.text_area(
-            "Custom Prompt",
-            placeholder="e.g., Focus on numerical KPIs, financial results, or technical architecture...",
-            height=120,
-        )
+if st.button("🧠 Analyze Career Fit", type="primary", use_container_width=True):
+    with st.spinner("Analyzing candidate evidence and role requirements..."):
+        st.session_state.resume_analysis=ai.analyze_resume(resume_text)
+        st.session_state.pd_analysis=ai.analyze_pd(pd_text)
+        st.session_state.match=ai.match(st.session_state.resume_analysis,st.session_state.pd_analysis)
+if not st.session_state.match:
+    st.info("Click Analyze Career Fit to generate the scorecard."); st.stop()
 
-    st.markdown("---")
-    st.caption("⚡ Powered by Advanced AI Processing")
-    st.markdown(f"[View project on GitHub]({GITHUB_URL})")
-    st.caption("Designed by Kam Rachakonda")
+match=st.session_state.match; dims=match.get("dimensions",{})
+def score(name):
+    try:return float(dims.get(name,{}).get("score",0))
+    except:return 0
+overall=round(sum(score(k)*v for k,v in WEIGHTS.items()))
 
-# Main Content: File Upload
-upload_spacer, upload_column = st.columns([1.35, 1])
-with upload_column:
-    uploaded_file = st.file_uploader(
-        "Upload PDF document(s)",
-        type=["pdf"],
-        help="Each PDF file must be less than 200 MB.",
-    )
+c=st.columns(4); c[0].metric("Overall Fit",f"{overall}/100"); c[1].metric("Resume Docs",len(resume_docs)); c[2].metric("Role Docs",len(pd_docs)); c[3].metric("Research Sources",len(st.session_state.research))
+score_df=pd.DataFrame([{"Dimension":k,"Score":score(k),"Weight":f"{v:.0%}","Status":dims.get(k,{}).get("status","Unknown")} for k,v in WEIGHTS.items()])
+st.dataframe(score_df,use_container_width=True,hide_index=True)
 
-if uploaded_file:
-    try:
-        reader = PdfReader(uploaded_file)
-        extracted_text, used_ocr = extract_pdf_text(
-            reader, uploaded_file.getvalue())
+if overall>=85: st.success("Strong alignment — position yourself as a high-confidence candidate.")
+elif overall>=70: st.info("Good alignment — targeted positioning and gap mitigation should improve competitiveness.")
+else: st.warning("Material gaps exist — focus on evidence and gap-closure strategy.")
 
-        if not extracted_text:
-            st.warning(
-                "⚠️ No readable text detected in this document. It may consist entirely of scanned images."
-            )
-        else:
-            if used_ocr:
-                st.info("Scanned pages detected. OCR was used to read the document.")
-            stats = TextProcessor.get_text_statistics(extracted_text)
-            numeric_stats = extract_numeric_statistics(extracted_text)
+t1,t2,t3,t4,t5,t6=st.tabs(["🎯 Strengths & Gaps","🔎 Evidence","🤖 Career Advisor","✍️ Resume Optimiser","🎤 Interview Prep","📄 Summarise"])
+with t1:
+    for name in WEIGHTS:
+        x=dims.get(name,{})
+        with st.expander(f"{name} — {x.get('score',0)}/100 · {x.get('status','Unknown')}"):
+            st.write("**Evidence:**",x.get("evidence","Not provided")); st.write("**Missing:**",x.get("missing","None identified")); st.write("**Recommendation:**",x.get("recommendation",""))
+with t2:
+    st.dataframe(pd.DataFrame([{"Requirement":k,"Status":dims.get(k,{}).get("status","Unknown"),"Evidence":dims.get(k,{}).get("evidence",""),"Gap":dims.get(k,{}).get("missing","")} for k in WEIGHTS]),use_container_width=True,hide_index=True)
+    st.markdown("### Why this score?"); st.write(match.get("overall_rationale",""))
+with t3:
+    q=st.text_area("Ask a career question",placeholder="Should I apply? How should I position myself? What are my biggest gaps?")
+    if q and st.button("Ask Advisor"):
+        context=st.session_state.rag.context(q,8) if st.session_state.rag else ""
+        if web_enabled:
+            role=st.session_state.pd_analysis.get("role_title",""); company=st.session_state.pd_analysis.get("company","")
+            st.session_state.research=research_context([q,f"{company} {role} skills priorities 2026"])
+        with st.spinner("Reasoning over your documents and research..."):
+            st.markdown(ai.advisor(q,context,format_research(st.session_state.research)))
+        if st.session_state.research:
+            with st.expander("External Sources"):
+                for i,r in enumerate(st.session_state.research,1): st.markdown(f"**[{i}] {r['title']}**  \\n{r['url']}")
+with t4:
+    task=st.text_area("Optimisation goal","Rewrite my executive summary and the most relevant experience bullets for this role. Preserve every fact and metric.")
+    if st.button("Generate Optimised Positioning"):
+        with st.spinner("Generating..."): st.markdown(ai.generate(task,f"RESUME:\n{resume_text}\n\nROLE:\n{pd_text}"))
+with t5:
+    task=st.text_area("Interview preparation","Create 10 likely questions, answer frameworks and STAR stories mapped to the role.")
+    if st.button("Generate Interview Pack"):
+        with st.spinner("Generating..."): st.markdown(ai.generate(task,f"RESUME:\n{resume_text}\n\nROLE:\n{pd_text}\n\nMATCH:\n{json.dumps(match)}"))
+with t6:
+    typ=st.selectbox("Summary type",["Executive","Detailed","Bullet points","Brief"])
+    if st.button("Summarise Documents"):
+        with st.spinner("Summarising..."): st.markdown(ai.generate(f"Create a {typ.lower()} summary highlighting purpose, themes, requirements and actionable takeaways.",f"{resume_text}\n\n{pd_text}"))
 
-            # Metadata Display
-            st.markdown("#### 📊 Document Overview")
-            col1, col2, col3, col4 = st.columns(4)
-
-            with col1:
-                st.markdown(
-                    f"""
-                    <div class="metric-container">
-                        <div class="metric-value">{len(reader.pages)}</div>
-                        <div class="metric-label">Pages</div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-
-            with col2:
-                st.markdown(
-                    f"""
-                    <div class="metric-container">
-                        <div class="metric-value">{stats["words"]:,}</div>
-                        <div class="metric-label">Words</div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-
-            with col3:
-                st.markdown(
-                    f"""
-                    <div class="metric-container">
-                        <div class="metric-value">{stats["characters"]:,}</div>
-                        <div class="metric-label">Characters</div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-
-            with col4:
-                st.markdown(
-                    f"""
-                    <div class="metric-container">
-                        <div class="metric-value">{stats["reading_time"]}</div>
-                        <div class="metric-label">Est. Read Time</div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-
-            st.write("")
-
-            if selected_type_key in {"bar_chart", "pie_chart"}:
-                st.markdown("#### 📈 Document Statistics")
-                if len(numeric_stats) >= 2:
-                    st.dataframe(numeric_stats, hide_index=True,
-                                 use_container_width=True)
-                    with st.container(border=True):
-                        if selected_type_key == "bar_chart":
-                            figure = px.bar(
-                                numeric_stats,
-                                x="Statistic",
-                                y="Value",
-                                color="Statistic",
-                                text_auto=True,
-                                title="Extracted PDF Statistics",
-                            )
-                        else:
-                            figure = px.pie(
-                                numeric_stats,
-                                names="Statistic",
-                                values="Value",
-                                title="Extracted PDF Statistics",
-                            )
-                        figure.update_layout(
-                            showlegend=True, margin=dict(t=70, l=20, r=20, b=20))
-                        st.plotly_chart(figure, use_container_width=True)
-                else:
-                    st.info(
-                        "No labeled statistics were detected. Add labels such as 'Revenue: 1200' to create a chart.")
-
-            # Action Button
-            if st.button("🚀 Generate Summary", type="primary", use_container_width=True):
-                with st.spinner("Analyzing document and extracting insights..."):
-                    summarizer = PDFSummarizer()
-                    raw_summary = summarizer.summarize(
-                        chunks=[extracted_text],
-                        summary_type=selected_type_key,
-                        custom_prompt=custom_prompt,
-                    )
-                    formatted_summary = SummaryFormatter.format_summary(
-                        raw_summary)
-
-                    st.markdown("### 📝 Generated Summary")
-                    st.markdown(
-                        f"""
-                        <div class="summary-card">
-                            {formatted_summary}
-                        </div>
-                        """,
-                        unsafe_allow_html=True,
-                    )
-
-                    st.download_button(
-                        label="📥 Download Summary as Text",
-                        data=formatted_summary,
-                        file_name=f"summary_{pdf_safe_text(uploaded_file.name.replace('.pdf', ''))}.txt",
-                        mime="text/plain",
-                    )
-
-                    pdf_data = create_summary_pdf(
-                        filename=uploaded_file.name,
-                        summary=formatted_summary,
-                        document_stats={
-                            **stats,
-                            "pages": len(reader.pages),
-                        },
-                        numeric_stats=numeric_stats,
-                    )
-                    st.download_button(
-                        label="📄 Download Executive Summary as PDF",
-                        data=pdf_data,
-                        file_name=f"executive_summary_{pdf_safe_text(uploaded_file.name.replace('.pdf', ''))}.pdf",
-                        mime="application/pdf",
-                    )
-
-    except Exception as e:
-        error_msg = ErrorHandler.handle_error(e, context="PDF Processing")
-        st.error(error_msg)
+st.divider(); st.caption("AI Career Intelligence • Streamlit + Groq + semantic RAG + optional web research")

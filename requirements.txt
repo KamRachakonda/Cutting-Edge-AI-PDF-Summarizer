@@ -12,3 +12,8 @@ reportlab
 pypdfium2
 pytesseract
 Pillow
+groq
+chromadb
+sentence-transformers
+requests
+python-docx
