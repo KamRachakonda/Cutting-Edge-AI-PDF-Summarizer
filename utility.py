@@ -1,11 +1,17 @@
 import json
 import logging
 import os
+import sys
 import time
 from datetime import datetime
 from functools import wraps
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
+
+# Make stdout/stderr tolerant of non-ASCII output (curly quotes, em dashes, etc.)
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 
 # Configure logging
@@ -32,7 +38,7 @@ def setup_logger(name: str = "PDFSummarizer", log_level: int = logging.INFO) -> 
         # File handler
         log_file = log_dir / \
             f"pdf_summarizer_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-        file_handler = logging.FileHandler(log_file)
+        file_handler = logging.FileHandler(log_file, encoding='utf-8')
         file_handler.setLevel(log_level)
 
         # Console handler
@@ -79,8 +85,8 @@ class ConfigManager:
             try:
                 with open(config_path, 'r', encoding='utf-8') as f:
                     config = json.load(f)
-                    logger.info(f"Configuration loaded from {config_path}")
-                    return {**ConfigManager.DEFAULT_CONFIG, **config}
+                logger.info(f"Configuration loaded from {config_path}")
+                return {**ConfigManager.DEFAULT_CONFIG, **config}
             except Exception as e:
                 logger.warning(
                     f"Error loading config: {str(e)}. Using defaults.")
@@ -137,8 +143,8 @@ class FileValidator:
         try:
             with open(file_path, 'rb') as f:
                 header = f.read(4)
-                if header != b'%PDF':
-                    return False, "Invalid PDF file (wrong header)"
+            if header != b'%PDF':
+                return False, "Invalid PDF file (wrong header)"
         except Exception as e:
             return False, f"Error reading file: {str(e)}"
 
@@ -247,7 +253,6 @@ class PerformanceUtils:
             def __exit__(self, *args):
                 elapsed = time.time() - self.start
                 logger.info(f"{operation_name} took {elapsed:.2f} seconds")
-
         return Timer()
 
 
@@ -325,16 +330,13 @@ class CacheManager:
         try:
             CacheManager.setup_cache()
             cache_file = CacheManager.CACHE_DIR / f"{key}.cache"
-
             cache_data = {
                 "timestamp": datetime.now().isoformat(),
                 "ttl": ttl_seconds,
                 "data": str(data),
             }
-
             with open(cache_file, 'w', encoding='utf-8') as f:
                 json.dump(cache_data, f)
-
             logger.debug(f"Data cached with key: {key}")
             return True
         except Exception as e:
@@ -354,7 +356,6 @@ class CacheManager:
         """
         try:
             cache_file = CacheManager.CACHE_DIR / f"{key}.cache"
-
             if not cache_file.exists():
                 return None
 
@@ -364,7 +365,6 @@ class CacheManager:
             # Check if cache expired
             cache_time = datetime.fromisoformat(cache_data["timestamp"])
             elapsed = (datetime.now() - cache_time).total_seconds()
-
             if elapsed > cache_data["ttl"]:
                 cache_file.unlink(missing_ok=True)  # Delete expired cache
                 logger.debug(f"Cache expired for key: {key}")

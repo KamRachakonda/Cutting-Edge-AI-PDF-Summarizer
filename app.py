@@ -104,6 +104,7 @@ def create_summary_pdf(
     numeric_stats: pd.DataFrame,
 ) -> bytes:
     """Create a print-ready executive summary PDF in memory."""
+    safe_filename = pdf_safe_text(filename)
     pdf_buffer = io.BytesIO()
     document = SimpleDocTemplate(
         pdf_buffer,
@@ -112,7 +113,7 @@ def create_summary_pdf(
         leftMargin=0.65 * inch,
         topMargin=0.6 * inch,
         bottomMargin=0.6 * inch,
-        title=f"Executive Summary - {filename}",
+        title=f"Executive Summary - {safe_filename}",
         author="Kam Rachakonda",
     )
     styles = getSampleStyleSheet()
@@ -156,7 +157,7 @@ def create_summary_pdf(
     story = [
         Paragraph("Executive PDF Summary", title_style),
         Paragraph(
-            f"{escape(pdf_safe_text(filename))} &nbsp;|&nbsp; Generated {datetime.now().strftime('%B %d, %Y')}",
+            f"{escape(safe_filename)} &nbsp;|&nbsp; Generated {datetime.now().strftime('%B %d, %Y')}",
             subtitle_style,
         ),
         Paragraph("Document Overview", heading_style),
@@ -164,10 +165,10 @@ def create_summary_pdf(
     overview_data = [
         ["Pages", "Words", "Characters", "Estimated reading time"],
         [
-            str(document_stats.get("pages", "-")),
-            f"{document_stats.get('words', 0):,}",
-            f"{document_stats.get('characters', 0):,}",
-            document_stats.get("reading_time", "-"),
+            pdf_safe_text(document_stats.get("pages", "-")),
+            pdf_safe_text(f"{document_stats.get('words', 0):,}"),
+            pdf_safe_text(f"{document_stats.get('characters', 0):,}"),
+            pdf_safe_text(document_stats.get("reading_time", "-")),
         ],
     ]
     overview_table = Table(overview_data, colWidths=[1.65 * inch] * 4)
@@ -533,7 +534,7 @@ if uploaded_file:
                     st.download_button(
                         label="📥 Download Summary as Text",
                         data=formatted_summary,
-                        file_name=f"summary_{uploaded_file.name.replace('.pdf', '')}.txt",
+                        file_name=f"summary_{pdf_safe_text(uploaded_file.name.replace('.pdf', ''))}.txt",
                         mime="text/plain",
                     )
 
@@ -549,7 +550,7 @@ if uploaded_file:
                     st.download_button(
                         label="📄 Download Executive Summary as PDF",
                         data=pdf_data,
-                        file_name=f"executive_summary_{uploaded_file.name.replace('.pdf', '')}.pdf",
+                        file_name=f"executive_summary_{pdf_safe_text(uploaded_file.name.replace('.pdf', ''))}.pdf",
                         mime="application/pdf",
                     )
 

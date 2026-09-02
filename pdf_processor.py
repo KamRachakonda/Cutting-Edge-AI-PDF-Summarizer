@@ -6,7 +6,8 @@ import pypdf
 
 class PDFSummarizer:
     def __init__(self, groq_api_key=None):
-        self.api_key = groq_api_key or os.getenv('GROQ_API_KEY')
+        self.api_key = (groq_api_key or os.getenv('GROQ_API_KEY') or '').strip(
+            " \'\"\u2018\u2019\u201c\u201d")
         if not self.api_key:
             raise ValueError('GROQ_API_KEY not found')
         self.llm = ChatGroq(
