@@ -1,0 +1,14 @@
+streamlit
+langchain
+langchain-groq
+langchain-core
+pypdf
+python-dotenv
+pandas
+tiktoken
+plotly
+numpy
+reportlab
+pypdfium2
+pytesseract
+Pillow
