@@ -8,24 +8,21 @@ import unicodedata
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-from reportlab.lib import colors
-from reportlab.lib.enums import TA_CENTER
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
-from reportlab.lib.units import inch
-from reportlab.platypus import (
-    Paragraph,
-    SimpleDocTemplate,
-    Spacer,
-    Table,
-    TableStyle,
-)
 from pypdf import PdfReader
 from dotenv import load_dotenv
 
 # Import backend classes
 from pdf_processor import PDFSummarizer, SummaryFormatter
 from utility import TextProcessor, ErrorHandler
+from career_intelligence import (
+    ExplainableResumeScorer,
+    QueryRouter,
+    SourceAwareRetriever,
+    WebResearcher,
+    career_report_markdown,
+    grounded_prompt,
+)
+from document_ingestion import ingest_document, DocumentIngestionError
 
 
 with open("pdf-summarizer-banner.png", "rb") as banner_file:
@@ -104,6 +101,24 @@ def create_summary_pdf(
     numeric_stats: pd.DataFrame,
 ) -> bytes:
     """Create a print-ready executive summary PDF in memory."""
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.enums import TA_CENTER
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+        from reportlab.lib.units import inch
+        from reportlab.platypus import (
+            Paragraph,
+            SimpleDocTemplate,
+            Spacer,
+            Table,
+            TableStyle,
+        )
+    except ImportError as error:
+        raise RuntimeError(
+            "PDF export requires ReportLab. Install it with: pip install reportlab"
+        ) from error
+
     safe_filename = pdf_safe_text(filename)
     pdf_buffer = io.BytesIO()
     document = SimpleDocTemplate(
@@ -381,6 +396,7 @@ with st.sidebar:
             "concise": "⚡ Concise (5-10 Sentences)",
             "detailed": "📑 Detailed (Headings & Depth)",
             "bullet_points": "📌 Key Bullet Points",
+            "executive": "💼 Executive (Insights & Actions)",
             "bar_chart": "📊 Bar Chart + Summary",
             "pie_chart": "🥧 Pie Chart + Summary",
         }
@@ -399,9 +415,29 @@ with st.sidebar:
             placeholder="e.g., Focus on numerical KPIs, financial results, or technical architecture...",
             height=120,
         )
+        include_analysis = st.checkbox(
+            "Analyze document structure", value=True)
+        include_quotes = st.checkbox("Extract key quotes", value=True)
 
     st.markdown("---")
     st.caption("⚡ Powered by Advanced AI Processing")
+    st.markdown("### Career Intelligence")
+    career_query = st.text_input(
+        "Question router",
+        placeholder="e.g., What skills am I missing for this role?",
+    )
+    if career_query:
+        route = QueryRouter().route(
+            career_query,
+            has_documents=st.session_state.get("uploaded_file_present", False),
+        )
+        research_urls = st.text_area(
+            "Company or role research URLs",
+            placeholder="One public company or role URL per line",
+            height=80,
+        )
+        st.info(
+            f"Route: {route.value.title()} | {QueryRouter().explain(career_query, route)}")
     st.markdown(f"[View project on GitHub]({GITHUB_URL})")
     st.caption("Designed by Kam Rachakonda")
 
@@ -414,6 +450,7 @@ with upload_column:
         help="Each PDF file must be less than 200 MB.",
     )
 
+st.session_state["uploaded_file_present"] = uploaded_file is not None
 if uploaded_file:
     try:
         reader = PdfReader(uploaded_file)
@@ -429,6 +466,15 @@ if uploaded_file:
                 st.info("Scanned pages detected. OCR was used to read the document.")
             stats = TextProcessor.get_text_statistics(extracted_text)
             numeric_stats = extract_numeric_statistics(extracted_text)
+            metadata = reader.metadata or {}
+
+            with st.expander("📄 PDF Metadata", expanded=False):
+                st.json({
+                    "title": metadata.get("/Title", "Unknown"),
+                    "author": metadata.get("/Author", "Unknown"),
+                    "subject": metadata.get("/Subject", "Unknown"),
+                    "pages": len(reader.pages),
+                })
 
             # Metadata Display
             st.markdown("#### 📊 Document Overview")
@@ -513,11 +559,13 @@ if uploaded_file:
             if st.button("🚀 Generate Summary", type="primary", use_container_width=True):
                 with st.spinner("Analyzing document and extracting insights..."):
                     summarizer = PDFSummarizer()
-                    raw_summary = summarizer.summarize(
-                        chunks=[extracted_text],
+                    chunks = summarizer.chunk_text(extracted_text)
+                    summary_result = summarizer.summarize_chunks(
+                        chunks=chunks,
                         summary_type=selected_type_key,
                         custom_prompt=custom_prompt,
                     )
+                    raw_summary = summary_result["combined_summary"]
                     formatted_summary = SummaryFormatter.format_summary(
                         raw_summary)
 
@@ -554,6 +602,132 @@ if uploaded_file:
                         mime="application/pdf",
                     )
 
+                    st.caption(
+                        f"Processed {summary_result['total_chunks']} document section(s)."
+                    )
+                    with st.expander("Section Summaries", expanded=False):
+                        for item in summary_result["individual_summaries"]:
+                            st.markdown(f"**Section {item['chunk_number']}**")
+                            st.markdown(item["summary"])
+                    if include_analysis:
+                        analysis_result = summarizer.analyze_document_structure(
+                            extracted_text)
+                        with st.expander("Document Structure Analysis", expanded=True):
+                            if analysis_result["status"] == "success":
+                                st.markdown(analysis_result["analysis"])
+                            else:
+                                st.warning(analysis_result["analysis"])
+                    if include_quotes:
+                        with st.expander("Key Quotes", expanded=False):
+                            for quote in summarizer.extract_key_quotes(extracted_text):
+                                st.markdown(f"> {quote}")
+
     except Exception as e:
         error_msg = ErrorHandler.handle_error(e, context="PDF Processing")
         st.error(error_msg)
+
+
+st.markdown("---")
+st.markdown("## Career Intelligence Workspace")
+st.caption("Evidence-backed resume analysis and career document generation.")
+career_col1, career_col2 = st.columns(2)
+with career_col1:
+    resume_text = st.text_area(
+        "Resume text",
+        placeholder="Paste the resume text to score and optimize.",
+        height=220,
+    )
+with career_col2:
+    jd_text = st.text_area(
+        "Job description",
+        placeholder="Paste the target job description.",
+        height=220,
+    )
+
+docx_file = st.file_uploader(
+    "Optional DOCX resume or job description",
+    type=["docx"],
+    key="career_docx",
+)
+if docx_file:
+    try:
+        docx_chunks = ingest_document(docx_file.getvalue(), docx_file.name)
+        docx_text = "\n\n".join(chunk.text for chunk in docx_chunks)
+        st.success(
+            f"Extracted {len(docx_text.split()):,} words from {docx_file.name}.")
+        st.text_area("Extracted DOCX text", docx_text,
+                     height=150, disabled=True)
+    except DocumentIngestionError as error:
+        st.error(str(error))
+
+if resume_text and jd_text:
+    scorer = ExplainableResumeScorer()
+    score = scorer.score(resume_text, jd_text)
+    st.metric("Explainable resume match", f"{score.overall:.2f}/100")
+    score_columns = st.columns(len(score.dimensions))
+    for column, dimension in zip(score_columns, score.dimensions):
+        with column:
+            st.metric(dimension.name.title(), f"{dimension.score:.2f}/100")
+            if dimension.matched:
+                st.caption(f"Matched: {', '.join(dimension.matched[:6])}")
+            if dimension.missing:
+                st.caption(f"Missing: {', '.join(dimension.missing[:6])}")
+
+    recommendations = [
+        f"Address missing {dimension.name} terms only with truthful evidence: "
+        f"{', '.join(dimension.missing) or 'none'}"
+        for dimension in score.dimensions
+    ]
+    report = career_report_markdown(score, recommendations)
+    research_evidence = []
+    if research_urls:
+        for url in research_urls.splitlines():
+            if not url.strip():
+                continue
+            try:
+                research_evidence.append(WebResearcher().fetch(url))
+            except Exception as error:
+                st.warning(f"Research source skipped: {error}")
+        if research_evidence:
+            st.info(
+                f"Loaded {len(research_evidence)} cited research source(s).")
+            report = career_report_markdown(
+                score, recommendations, research_evidence)
+    st.download_button(
+        "Download career intelligence report",
+        data=report,
+        file_name="career_intelligence_report.md",
+        mime="text/markdown",
+    )
+
+    action_col1, action_col2 = st.columns(2)
+    with action_col1:
+        if st.button("Optimize LinkedIn profile", use_container_width=True):
+            try:
+                summarizer = PDFSummarizer()
+                evidence = [
+                    f"Resume: {line}" for line in resume_text.splitlines() if line.strip()]
+                result = summarizer.summarize(
+                    [grounded_prompt(
+                        "Rewrite the LinkedIn headline, About section, and experience bullets "
+                        "for this target role. Keep every claim supported by evidence.", evidence
+                    )], summary_type="detailed")
+                st.markdown(result)
+            except Exception as error:
+                st.error(ErrorHandler.handle_error(
+                    error, context="LinkedIn optimization"))
+    with action_col2:
+        if st.button("Generate cover letter", use_container_width=True):
+            try:
+                summarizer = PDFSummarizer()
+                result = summarizer.summarize(
+                    [grounded_prompt(
+                        "Write a tailored cover letter using only the resume evidence and job "
+                        "description. Mark unsupported details as [NEEDS CONFIRMATION].",
+                        [f"Resume: {resume_text}",
+                            f"Job description: {jd_text}"],
+                    )], summary_type="detailed")
+                st.markdown(result)
+            except Exception as error:
+                st.error(ErrorHandler.handle_error(
+                    error, context="Cover letter generation"))
