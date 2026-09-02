@@ -1,6 +1,7 @@
 streamlit
 langchain
 langchain-groq
+langchain-openai
 langchain-core
 pypdf
 python-dotenv
@@ -12,3 +13,4 @@ reportlab
 pypdfium2
 pytesseract
 Pillow
+python-docx
