@@ -14,3 +14,7 @@ pypdfium2
 pytesseract
 Pillow
 python-docx
+groq
+chromadb
+sentence-transformers
+requests

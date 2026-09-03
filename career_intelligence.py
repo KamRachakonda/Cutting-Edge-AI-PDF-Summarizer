@@ -1,15 +1,13 @@
-"""Core career-intelligence primitives that do not depend on Streamlit or an LLM."""
-
+"""Deterministic, explainable career-intelligence primitives."""
 from __future__ import annotations
 
 import re
-from html import unescape
-from urllib.parse import urlparse
-from urllib.request import Request, urlopen
 from dataclasses import dataclass, field
 from enum import Enum
+from html import unescape
 from typing import Iterable, List, Mapping, Optional, Sequence
-
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 @dataclass(frozen=True)
 class DocumentChunk:
@@ -18,46 +16,27 @@ class DocumentChunk:
     page: Optional[int] = None
     section: Optional[str] = None
     metadata: Mapping[str, str] = field(default_factory=dict)
-
     @property
     def citation(self) -> str:
         location = f", page {self.page}" if self.page else ""
         section = f", {self.section}" if self.section else ""
         return f"{self.source}{location}{section}"
 
-
 class QueryRoute(str, Enum):
     DOCUMENT = "document"
     WEB = "web"
     HYBRID = "hybrid"
 
-
 class QueryRouter:
-    """Route questions using explicit source availability and intent signals."""
-
-    WEB_TERMS = frozenset({
-        "current", "latest", "recent", "today", "company", "competitor",
-        "salary", "market", "industry", "news", "linkedin", "website",
-        "role", "job", "hiring", "culture",
-    })
-
-    def route(self, query: str, has_documents: bool = True,
-              web_enabled: bool = True) -> QueryRoute:
-        normalized = set(re.findall(r"[a-z]+", query.lower()))
-        requests_web = bool(normalized & self.WEB_TERMS)
-        if requests_web and has_documents and web_enabled:
-            return QueryRoute.HYBRID
-        if requests_web and web_enabled:
-            return QueryRoute.WEB
+    WEB_TERMS = frozenset({"current", "latest", "recent", "today", "company", "competitor", "salary", "market", "industry", "news", "culture", "stock", "hiring"})
+    def route(self, query: str, has_documents: bool = True, web_enabled: bool = True) -> QueryRoute:
+        terms = set(re.findall(r"[a-z]+", query.lower()))
+        needs_web = bool(terms & self.WEB_TERMS)
+        if needs_web and has_documents and web_enabled: return QueryRoute.HYBRID
+        if needs_web and web_enabled: return QueryRoute.WEB
         return QueryRoute.DOCUMENT if has_documents else QueryRoute.WEB
-
     def explain(self, query: str, route: QueryRoute) -> str:
-        if route is QueryRoute.DOCUMENT:
-            return "Answered from uploaded documents because no current web source was requested."
-        if route is QueryRoute.WEB:
-            return "Answered from web research because the question requires current external information."
-        return "Combined uploaded-document evidence with current web research."
-
+        return {QueryRoute.DOCUMENT: "Uses uploaded evidence only.", QueryRoute.WEB: "Uses external sources because the question needs current context.", QueryRoute.HYBRID: "Combines uploaded evidence with external context."}[route]
 
 @dataclass(frozen=True)
 class Evidence:
@@ -65,51 +44,32 @@ class Evidence:
     source: str
     page: Optional[int] = None
     relevance: float = 0.0
-
     @property
     def citation(self) -> str:
         return f"{self.source}, page {self.page}" if self.page else self.source
 
-
 class SourceAwareRetriever:
-    """Small deterministic lexical retriever that retains source/page provenance."""
-
-    def __init__(self, chunks: Sequence[DocumentChunk]):
-        self.chunks = list(chunks)
-
+    def __init__(self, chunks: Sequence[DocumentChunk]): self.chunks = list(chunks)
     def retrieve(self, query: str, limit: int = 5) -> List[Evidence]:
         terms = set(re.findall(r"[a-z0-9+#.-]+", query.lower()))
         ranked = []
         for chunk in self.chunks:
             words = set(re.findall(r"[a-z0-9+#.-]+", chunk.text.lower()))
             overlap = len(terms & words)
-            if overlap:
-                ranked.append(Evidence(chunk.text, chunk.source, chunk.page,
-                                       overlap / max(1, len(terms))))
-        ranked.sort(key=lambda item: (-item.relevance,
-                    item.source, item.page or 0))
+            if overlap: ranked.append(Evidence(chunk.text, chunk.source, chunk.page, overlap / max(1, len(terms))))
+        ranked.sort(key=lambda x: (-x.relevance, x.source, x.page or 0))
         return ranked[:limit]
 
-
 class WebResearcher:
-    """Fetch user-supplied public sources without inventing company facts."""
-
     def fetch(self, url: str, timeout: int = 10) -> Evidence:
         parsed = urlparse(url.strip())
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            raise ValueError("Research URLs must use http:// or https://.")
-        request = Request(
-            url, headers={"User-Agent": "CareerIntelligence/1.0"})
-        with urlopen(request, timeout=timeout) as response:
-            raw = response.read(500_000).decode("utf-8", errors="replace")
-        text = re.sub(r"<script[^>]*>.*?</script>|<style[^>]*>.*?</style>", " ", raw,
-                      flags=re.IGNORECASE | re.DOTALL)
-        text = re.sub(r"<[^>]+>", " ", unescape(text))
-        text = re.sub(r"\s+", " ", text).strip()
-        if not text:
-            raise ValueError("The research source contained no readable text.")
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc: raise ValueError("Research URLs must use http:// or https://.")
+        request = Request(url, headers={"User-Agent": "CareerIntelligence/1.0"})
+        with urlopen(request, timeout=timeout) as response: raw = response.read(500_000).decode("utf-8", errors="replace")
+        text = re.sub(r"<script[^>]*>.*?</script>|<style[^>]*>.*?</style>", " ", raw, flags=re.I|re.S)
+        text = re.sub(r"<[^>]+>", " ", unescape(text)); text = re.sub(r"\s+", " ", text).strip()
+        if not text: raise ValueError("The research source contained no readable text.")
         return Evidence(text[:12000], url)
-
 
 @dataclass(frozen=True)
 class ScoreDimension:
@@ -119,102 +79,51 @@ class ScoreDimension:
     missing: tuple[str, ...]
     evidence: tuple[str, ...]
 
-
 @dataclass(frozen=True)
 class ResumeJDScore:
     overall: float
     dimensions: tuple[ScoreDimension, ...]
-    caveat: str = "Score reflects only explicit text matches; it does not infer experience."
-
+    caveat: str = "Scores are deterministic and based on explicit evidence; absence of a term is not proof of lack of capability."
     @property
-    def evidence(self) -> List[str]:
-        return [item for dimension in self.dimensions for item in dimension.evidence]
-
+    def evidence(self) -> List[str]: return [e for d in self.dimensions for e in d.evidence]
 
 class ExplainableResumeScorer:
-    """Deterministic score based on explicit terms and resume evidence only."""
-
-    WEIGHTS = {"skills": 0.50, "experience": 0.30, "education": 0.20}
-    SECTION_TERMS = {
-        "skills": ("requirements", "skills", "technologies", "tools", "qualifications"),
-        "experience": ("experience", "responsibilities", "years", "senior", "lead"),
-        "education": ("education", "degree", "certification", "bachelor", "master"),
+    WEIGHTS = {"Technical & Architecture": .20, "Leadership": .15, "Customer & Consulting": .15, "Cloud": .10, "AI / GenAI": .15, "Business Impact": .15, "Industry Alignment": .10}
+    VOCABULARY = {
+        "Technical & Architecture": ["architecture", "solution architecture", "api", "integration", "system design", "software", "saas", "technical"],
+        "Leadership": ["leadership", "leader", "manage", "managed", "mentor", "coach", "team", "director", "strategy"],
+        "Customer & Consulting": ["customer", "client", "consulting", "consultant", "stakeholder", "trusted advisor", "discovery", "workshop"],
+        "Cloud": ["cloud", "aws", "azure", "gcp", "kubernetes", "docker", "cloud architecture"],
+        "AI / GenAI": ["ai", "genai", "generative ai", "machine learning", "llm", "agentic", "artificial intelligence"],
+        "Business Impact": ["revenue", "growth", "roi", "business impact", "cost", "efficiency", "transformation", "kpi", "target"],
+        "Industry Alignment": ["banking", "financial services", "consulting", "technology", "enterprise", "healthcare", "retail", "government"],
     }
-
+    @staticmethod
+    def _present(term: str, text: str) -> bool: return bool(re.search(rf"(?<![a-z0-9]){re.escape(term.lower())}(?![a-z0-9])", text.lower()))
+    @staticmethod
+    def _evidence(term: str, text: str) -> str:
+        for line in text.splitlines():
+            if ExplainableResumeScorer._present(term, line): return f"{term}: {line.strip()}"
+        return f"{term}: explicit match found in resume."
     def score(self, resume_text: str, jd_text: str) -> ResumeJDScore:
-        resume = resume_text.lower()
-        jd = jd_text.lower()
         dimensions = []
         for name, weight in self.WEIGHTS.items():
-            candidates = self._terms_for_dimension(jd, name)
-            matched = tuple(
-                term for term in candidates if self._term_in_text(term, resume))
-            missing = tuple(term for term in candidates if term not in matched)
-            score = round(100 * len(matched) / max(1, len(candidates)), 2)
-            evidence = tuple(self._evidence_for(term, resume_text)
-                             for term in matched)
-            dimensions.append(ScoreDimension(
-                name, score, matched, missing, evidence))
-        overall = round(
-            sum(item.score * self.WEIGHTS[item.name] for item in dimensions), 2)
-        return ResumeJDScore(overall, tuple(dimensions))
-
-    def _terms_for_dimension(self, jd: str, dimension: str) -> List[str]:
-        sentences = re.split(r"[\n.;]+", jd)
-        selected = " ".join(sentence for sentence in sentences
-                            if any(marker in sentence for marker in self.SECTION_TERMS[dimension]))
-        terms = re.findall(r"[a-z][a-z0-9+#.-]{2,}", selected)
-        stop = {
-            "the", "and", "with", "for", "from", "this", "that", "are", "you", "our",
-            "skills", "requirements", "technologies", "tools", "qualifications",
-            "experience", "responsibilities", "years", "senior", "lead",
-            "education", "degree", "certification", "bachelor", "master",
-        }
-        return list(dict.fromkeys(term for term in terms if term not in stop))
-
-    @staticmethod
-    def _term_in_text(term: str, text: str) -> bool:
-        return bool(re.search(rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])", text))
-
-    @staticmethod
-    def _evidence_for(term: str, resume_text: str) -> str:
-        for line in resume_text.splitlines():
-            if ExplainableResumeScorer._term_in_text(term, line.lower()):
-                return f"Resume evidence for '{term}': {line.strip()}"
-        return f"Resume evidence for '{term}': explicit match found."
-
+            terms = [t for t in self.VOCABULARY[name] if self._present(t, jd_text)]
+            if not terms: terms = [t for t in self.VOCABULARY[name] if self._present(t, resume_text)]
+            matched = tuple(t for t in terms if self._present(t, resume_text)); missing = tuple(t for t in terms if t not in matched)
+            dimensions.append(ScoreDimension(name, round(100*len(matched)/max(1,len(terms)),2), matched, missing, tuple(self._evidence(t,resume_text) for t in matched)))
+        return ResumeJDScore(round(sum(d.score*self.WEIGHTS[d.name] for d in dimensions),2), tuple(dimensions))
 
 def grounded_prompt(task: str, evidence: Iterable[Evidence | str]) -> str:
-    """Build a prompt that forbids unsupported career claims."""
-    evidence_lines = []
-    for item in evidence:
-        if isinstance(item, Evidence):
-            evidence_lines.append(f"- [{item.citation}] {item.text}")
-        else:
-            evidence_lines.append(f"- {item}")
-    return (
-        "You are a careful career assistant. Use only the evidence below. "
-        "Never invent employers, dates, degrees, certifications, skills, metrics, "
-        "or achievements. Mark missing information as [NEEDS CONFIRMATION]. "
-        "Cite the evidence supporting every major recommendation.\n\n"
-        f"Task: {task}\n\nEvidence:\n" + "\n".join(evidence_lines)
-    )
+    lines = [f"- [{x.citation}] {x.text}" if isinstance(x,Evidence) else f"- {x}" for x in evidence]
+    return "Use only the evidence below. Never invent employers, dates, degrees, certifications, skills, metrics, or achievements. Mark unsupported details as [NEEDS CONFIRMATION]. Cite evidence for material claims.\n\nTask: " + task + "\n\nEvidence:\n" + "\n".join(lines)
 
-
-def career_report_markdown(score: ResumeJDScore, recommendations: Sequence[str],
-                           research: Sequence[Evidence] = ()) -> str:
-    """Create a portable career-intelligence report suitable for download."""
-    lines = ["# Career Intelligence Report", "", f"**Resume-JD score:** {score.overall}/100", "",
-             "## Score Breakdown"]
-    for dimension in score.dimensions:
-        lines.append(f"- **{dimension.name.title()}:** {dimension.score}/100")
-        if dimension.missing:
-            lines.append(
-                f"  Missing explicit terms: {', '.join(dimension.missing)}")
-    lines.extend(["", "## Recommendations"])
-    lines.extend(f"- {recommendation}" for recommendation in recommendations)
-    lines.extend(["", "## Evidence"])
-    lines.extend(f"- {evidence}" for evidence in score.evidence)
-    lines.extend(f"- [{item.citation}] {item.text}" for item in research)
-    lines.append(f"\n_{score.caveat}_")
+def career_report_markdown(score: ResumeJDScore, recommendations: Sequence[str], research: Sequence[Evidence] = ()) -> str:
+    lines=["# Career Intelligence Report","",f"**Resume-JD score:** {score.overall}/100","","## Score Breakdown"]
+    for d in score.dimensions:
+        lines.append(f"- **{d.name}:** {d.score}/100")
+        if d.missing: lines.append(f"  - Missing explicit evidence: {', '.join(d.missing)}")
+    lines += ["","## Recommendations"]; lines += [f"- {r}" for r in recommendations]; lines += ["","## Evidence"]; lines += [f"- {e}" for e in score.evidence]
+    if research: lines += ["","## External Research"] + [f"- [{e.citation}] {e.text[:1200]}" for e in research]
+    lines += ["",f"_{score.caveat}_"]
     return "\n".join(lines)
