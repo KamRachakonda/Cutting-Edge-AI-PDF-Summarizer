@@ -58,6 +58,17 @@ class PDFSummarizer:
             model_name='openai/gpt-oss-20b',
             temperature=0
         )
+        self.usage = {'prompt_tokens': 0, 'completion_tokens': 0,
+                      'total_tokens': 0, 'requests': 0}
+
+    def _record_usage(self, response):
+        metadata = getattr(response, 'usage_metadata', {}) or {}
+        self.usage['prompt_tokens'] += int(metadata.get(
+            'prompt_tokens', metadata.get('input_tokens', 0)) or 0)
+        self.usage['completion_tokens'] += int(metadata.get(
+            'completion_tokens', metadata.get('output_tokens', 0)) or 0)
+        self.usage['total_tokens'] += int(metadata.get('total_tokens', 0) or 0)
+        self.usage['requests'] += 1
 
     @staticmethod
     def chunk_text(text: str, max_characters: int = 12000) -> List[str]:
@@ -107,7 +118,7 @@ class PDFSummarizer:
             'instruction': instruction,
             'text': text
         })
-
+        self._record_usage(response)
         return response.content
 
     def summarize_chunks(self, chunks: List[str], summary_type: str = 'detailed',
@@ -163,6 +174,7 @@ class PDFSummarizer:
                 for index, summary in enumerate(summaries)
             ),
         })
+        self._record_usage(response)
         return response.content
 
     def analyze_document_structure(self, text: str) -> Dict[str, str]:

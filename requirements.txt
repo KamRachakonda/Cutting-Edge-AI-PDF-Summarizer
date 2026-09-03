@@ -18,3 +18,5 @@ groq
 chromadb
 sentence-transformers
 requests
+python-docx
+tavily-python
